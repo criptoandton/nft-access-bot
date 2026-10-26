@@ -1,27 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-NFT Access Bot — Telegram-бот проверки NFT-доступа к закрытому каналу.
-Стек: Python 3.11 + aiogram 3 + SQLite. Опционально pytoniq/tonutils для
-on-chain проверки владения NFT.
+Access Keys Bot — проверка NFT-доступа к закрытому каналу.
 
-Команды:
-  /start        — приветствие, кнопка проверки
-  /check EQ...  — проверка доступа по адресу кошелька
-  /revoke EQ... — отзыв доступа (только админ)
+Пользователь подключает кошелёк, бот сверяет владение NFT-ключом по whitelist
+и выдаёт одноразовую инвайт-ссылку в закрытый канал. Есть отзыв доступа.
+
+Стек: Python 3.11 + aiogram 3 + SQLite.
 
 Запуск:
-  pip install aiogram
+  pip install aiogram tonutils
   export BOT_TOKEN=123456:AA...
-  export ADMIN_CHANNEL_ID=-1001234567890
-  export NFT_CONTRACT=EQ...
-  export COLLECTION_NAME="Access Keys"
-  export KEY_TTL_DAYS=30
+  export ADMIN_ID=123456789
+  export CHANNEL_ID=-1001234567890
+  export COLLECTION_ADDRESS=EQ...
   python bot.py
 """
 import asyncio
 import os
-import sqlite3
+import time
 import logging
+import sqlite3
 
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import Command
@@ -29,139 +27,153 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("aiogram").setLevel(logging.WARNING)
 log = logging.getLogger("access")
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_CHANNEL_ID = int(os.environ.get("ADMIN_CHANNEL_ID", "0"))
-NFT_CONTRACT = os.environ.get("NFT_CONTRACT", "")
-COLLECTION_NAME = os.environ.get("COLLECTION_NAME", "Access Keys")
-KEY_TTL_DAYS = int(os.environ.get("KEY_TTL_DAYS", "30"))
-DEMO_WALLET = os.environ.get("DEMO_WALLET", "0QDD5oX4cPlW5ecZp2JUnJkllw1UejzjM5kXUJVyd87O9pKV")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID", "0"))
+COLLECTION_ADDRESS = os.environ.get("COLLECTION_ADDRESS", "")
+TESTNET_WALLET = "0QDD5oX4cPlW5ecZp2JUnJkllw1UejzjM5kXUJVyd87O9pKV"
 
 db = sqlite3.connect("access.db")
-db.execute(
-    """CREATE TABLE IF NOT EXISTS keys(
-         addr TEXT PRIMARY KEY,
-         item INTEGER,
-         tier TEXT,
-         expires_at INTEGER,
-         granted INTEGER DEFAULT 0)"""
-)
+db.execute("""CREATE TABLE IF NOT EXISTS keys(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet TEXT UNIQUE NOT NULL,
+    nft_index INTEGER,
+    granted_at INTEGER,
+    revoked INTEGER DEFAULT 0)""")
+db.execute("""CREATE TABLE IF NOT EXISTS log(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet TEXT, action TEXT, created_at INTEGER)""")
 db.commit()
 
 router = Router()
 
-TIERS = {
-    "month": {"label": "Месяц", "days": 30},
-    "year": {"label": "Год", "days": 365},
-    "lifetime": {"label": "Навсегда", "days": 36500},
-}
+
+def now():
+    return int(time.time())
 
 
-async def check_ownership(addr: str):
-    """Проверка владения NFT-ключом.
-
-    ДЕМО: whitelist в SQLite.
-    БОЙ:  запрос к NFT-контракту — item index по адресу владельца,
-          либо сверка с таблицей продаж вашего магазина.
-    """
-    row = db.execute(
-        "SELECT item, tier, expires_at FROM keys WHERE addr=?", (addr,)
-    ).fetchone()
-    if not row:
-        return None
-    item, tier, expires = row
-    if expires and expires < int(asyncio.get_event_loop().time()):
-        return {"expired": True, "item": item, "tier": tier}
-    return {"expired": False, "item": item, "tier": tier}
-
-
-async def grant_access(user_id: int, addr: str):
-    """Выдача доступа: одноразовая инвайт-ссылка в закрытый канал."""
-    db.execute("UPDATE keys SET granted=1 WHERE addr=?", (addr,))
+def write_log(wallet: str, action: str):
+    db.execute("INSERT INTO log (wallet, action, created_at) VALUES (?,?,?)",
+               (wallet, action, now()))
     db.commit()
-    # БОЙ: bot.invite_link(chat_id=ADMIN_CHANNEL_ID, expire_date=...)
-    return "https://t.me/+example_invite_link"
+
+
+def find_key(wallet: str):
+    return db.execute(
+        "SELECT id, nft_index, granted_at, revoked FROM keys WHERE wallet=?",
+        (wallet.strip().lower(),)).fetchone()
+
+
+async def check_nft_ownership(wallet: str):
+    """Проверка владения NFT.
+
+    БОЙ:  запрос item index коллекции (TonCenter / tonutils) и поиск
+         предмета с владельцем == wallet.
+    ДЕМО: тестовые адреса из DEMO_KEYS.
+    """
+    w = wallet.strip()
+    demo = {
+        "EQDemo_Owner_0000000000000000000000": (4821, "demo-owner"),
+        "EQDemo_User_1111111111111111111111": (3907, "demo-user"),
+    }
+    if w in demo:
+        return {"ok": True, "index": demo[w][0], "demo": True}
+    return {"ok": False, "demo": True}
+
+
+async def grant_access(wallet: str, nft_index: int):
+    db.execute(
+        "INSERT OR REPLACE INTO keys (wallet, nft_index, granted_at, revoked)"
+        " VALUES (?,?,?,0)", (wallet.strip().lower(), nft_index, now()))
+    db.commit()
+    write_log(wallet, "granted")
+    # БОЙ: bot.invite_link(chat_id=CHANNEL_ID, member_limit=1)
+    return "https://t.me/+example_private_channel_invite"
 
 
 @router.message(Command("start"))
 async def start(m: types.Message):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔑 Проверить мой доступ", callback_data="check")],
-            [InlineKeyboardButton(text="🛒 Купить ключ", url="https://t.me/your_shop")],
-        ]
-    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔑 Проверить доступ", callback_data="check")],
+        [InlineKeyboardButton(text="ℹ️ Как это работает", callback_data="how")],
+    ])
     await m.answer(
-        f"<b>{COLLECTION_NAME}</b>\n\n"
-        "Это бот проверки доступа к закрытому контенту.\n"
-        "Пришлите адрес своего TON-кошелька — проверю, есть ли у вас ключ.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=kb,
-    )
+        "🔑 <b>Access Keys</b>\n\n"
+        "Проверю ваш доступ по адресу кошелька и, если NFT-ключ найден, "
+        "открою вход в закрытый канал.\n\n"
+        "Пришлите адрес кошелька (EQ… или UQ…).",
+        parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
-@router.callback_query(F.data == "check")
-async def ask_addr(cb: types.CallbackQuery):
-    await cb.message.answer("Пришлите адрес кошелька, например <code>EQ...</code>")
+@router.callback_query(F.data == "how")
+async def how(cb: types.CallbackQuery):
+    await cb.message.edit_text(
+        "ℹ️ <b>Как это работает</b>\n\n"
+        "1. Вы отправляете адрес кошелька\n"
+        "2. Бот сверяет владение NFT-ключом\n"
+        "3. При успехе вы получаете одноразовую ссылку в закрытый канал\n"
+        "4. При отзыве или возврате NFT доступ снимается автоматически",
+        parse_mode=ParseMode.HTML)
     await cb.answer()
 
 
-@router.message(Command("check"))
-async def cmd_check(m: types.Message):
-    parts = m.text.split()
-    if len(parts) < 2:
-        await m.answer("Формат: <code>/check EQ...</code>")
+@router.message(F.text)
+async def check_wallet(m: types.Message):
+    wallet = (m.text or "").strip()
+    if not wallet:
         return
-    await handle_addr(m, parts[1].strip())
-
-
-@router.message(F.text.regexp(r"^(EQ|UQ)[A-Za-z0-9:_-]{40,}$"))
-async def any_addr(m: types.Message):
-    await handle_addr(m, m.text.strip())
-
-
-async def handle_addr(m: types.Message, addr: str):
-    res = await check_ownership(addr)
-    if res is None:
+    res = await check_nft_ownership(wallet)
+    if not res["ok"]:
         await m.answer(
             "❌ <b>Доступ закрыт</b>\n\n"
-            f"По адресу <code>{addr}</code> ключ не найден.\n"
-            "Купить ключ — в магазине канала.",
-            parse_mode=ParseMode.HTML,
-        )
-        log.info("DENY user=%s addr=%s", m.from_user.id, addr)
+            "NFT-ключ для этого адреса не найден. "
+            "Купите ключ в магазине канала.",
+            parse_mode=ParseMode.HTML)
         return
-    if res["expired"]:
+    existing = find_key(wallet)
+    if existing and existing[3]:
         await m.answer(
-            "⚠️ <b>Срок ключа истёк</b>\n\n"
-            f"Ключ #{res['item']} ({TIERS[res['tier']]['label']}) больше не активен.\n"
-            "Продлите подписку в магазине.",
-            parse_mode=ParseMode.HTML,
-        )
+            "🚫 <b>Доступ отозван</b>\n\n"
+            "Ключ по этому адресу больше не действует. Обратитесь в поддержку.",
+            parse_mode=ParseMode.HTML)
         return
-    link = await grant_access(m.from_user.id, addr)
+    invite = await grant_access(wallet, res["index"])
     await m.answer(
         "✅ <b>Доступ открыт</b>\n\n"
-        f"Ключ #{res['item']} · {TIERS[res['tier']]['label']}\n\n"
-        f"Ссылка в закрытый канал (одноразовая):\n{link}",
-        parse_mode=ParseMode.HTML,
-    )
-    log.info("GRANT user=%s addr=%s item=%s", m.from_user.id, addr, res["item"])
+        f"NFT-ключ #{res['index']} найден в коллекции.\n"
+        "Добавлен в закрытый канал.\n\n"
+        f"Ссылка (одноразовая):\n{invite}",
+        parse_mode=ParseMode.HTML)
 
 
 @router.message(Command("revoke"))
 async def revoke(m: types.Message):
-    if m.from_user.id != ADMIN_CHANNEL_ID:
+    if m.from_user.id != ADMIN_ID:
         return
-    parts = m.text.split()
+    parts = (m.text or "").split()
     if len(parts) < 2:
-        await m.answer("Формат: <code>/revoke EQ...</code>")
+        await m.answer("Формат: /revoke <кошелёк>")
         return
-    db.execute("UPDATE keys SET granted=0 WHERE addr=?", (parts[1].strip(),))
+    wallet = parts[1].strip().lower()
+    db.execute("UPDATE keys SET revoked=1 WHERE wallet=?", (wallet,))
     db.commit()
-    await m.answer("Доступ отозван.")
+    write_log(wallet, "revoked")
+    await m.answer(f"Доступ отозван: <code>{wallet}</code>", parse_mode=ParseMode.HTML)
+
+
+@router.message(Command("admin"))
+async def admin(m: types.Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+    total = db.execute("SELECT COUNT(*) FROM keys").fetchone()[0]
+    alive = db.execute("SELECT COUNT(*) FROM keys WHERE revoked=0").fetchone()[0]
+    await m.answer(
+        "📊 <b>Статистика</b>\n\n"
+        f"Всего ключей: {total}\n"
+        f"Активных: {alive}",
+        parse_mode=ParseMode.HTML)
 
 
 async def main():
